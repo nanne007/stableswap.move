@@ -14,7 +14,7 @@ module Owner::Pool {
 
     const MAX_ADMIN_FEE: u128 = 10 * 1000 * 1000 * 1000; // 10 * 1e9
     const MAX_FEE: u128 = 5 * 1000 * 1000 * 1000; // 5 * 1e9
-
+    const FEE_DENOMINATOR: u128 = 10 * 1000 * 1000 * 1000; // 1e10
 
 
 
@@ -25,11 +25,12 @@ module Owner::Pool {
         future_A: u128,
         initial_A_time: u128,
         future_A_time: u128,
+        balances: vector<u128>,
     }
 
     struct PoolConfig<phantom T1, phantom T2, phantom T3> has key {
-        fee: u64,
-        admin_fee: u64,
+        fee: u128,
+        admin_fee: u128,
 
         lending_precision: u8,
         /// the precison to convert to
@@ -38,18 +39,24 @@ module Owner::Pool {
         rates: vector<u128>,
     }
 
+    struct PoolCapabilities<phantom T1, phantom T2, phantom T3> has key {
+        mint_cap: Token::MintCapability<PoolTokenT<T1,T2,T3>>,
+        burn_cap: Token::BurnCapability<PoolTokenT<T1,T2,T3>>,
+    }
+
     struct Pool<phantom T1, phantom T2, phantom T3> has key {
         t1: Token::Token<T1>,
         t2: Token::Token<T2>,
         t3: Token::Token<T3>,
     }
 
-    public fun initialize<T1, T2, T3>(sender: &signer, initial_A: u128,fee: u64,admin_fee: u64) {
+    public fun initialize<T1, T2, T3>(sender: &signer, initial_A: u128,fee: u128,admin_fee: u128) {
         move_to(sender, PoolInfo<T1,T2,T3> {
             initial_A,
             future_A: initial_A,
             initial_A_time: 0u128,
             future_A_time: 0u128,
+            balances: vector[0u128, 0u128, 0u128],
         });
         let precision = 9;
         let lending_precision = 9;
@@ -71,26 +78,109 @@ module Owner::Pool {
             precision: (precision as u8),
             precision_mul,
             rates,
-
         });
+
+        {
+            Token::register_token<PoolTokenT<T1,T2,T3>>(sender, 9u8);
+            let mint_cap = Token::remove_mint_capability<PoolTokenT<T1,T2,T3>>(sender);
+            let burn_cap = Token::remove_burn_capability<PoolTokenT<T1,T2,T3>>(sender);
+            move_to(sender, PoolCapabilities {
+                mint_cap, burn_cap
+            });
+        }
     }
 
-    public fun balances<T1, T2, T3>(): vector<u128> acquires Pool {
-        balances_(borrow_global<Pool<T1, T2, T3>>(@Owner))
+    public fun balances<T1, T2, T3>(): vector<u128> acquires PoolInfo {
+        *&borrow_global<PoolInfo<T1, T2, T3>>(@Owner).balances
     }
 
     public fun add_liquidity<T1, T2, T3>(
-        _t1: &mut Token::Token<T1>, _t2: &mut Token::Token<T2>, _t3: &mut Token::Token<T3>, _min_mint_amount: u128
-    ) acquires PoolInfo, PoolConfig {
-        let _fees: vector<u128> = vector[];
-        let pool_info = borrow_global<PoolInfo<T1, T2, T3>>(@Owner);
+        _t1: Token::Token<T1>, _t2:  Token::Token<T2>, _t3: Token::Token<T3>, _min_mint_amount: u128
+    ): Token::Token<PoolTokenT<T1,T2,T3>> acquires PoolInfo, PoolConfig, PoolCapabilities, Pool {
+        let pool_info = borrow_global_mut<PoolInfo<T1, T2, T3>>(@Owner);
         let pool_config = borrow_global<PoolConfig<T1, T2, T3>>(@Owner);
-        let _fee = pool_config.fee * N_COINS / (4 * (N_COINS-1));
-        let _admin_fee= pool_config.admin_fee;
 
-        let _amp = A_(pool_info);
+        let n_coins = (N_COINS as u64);
+        let fee = pool_config.fee * (n_coins as u128) / (4 * ((n_coins as u128)-1));
+        let fee = (fee as u128);
+        let admin_fee= (pool_config.admin_fee as u128);
 
-        let _total_supply = Token::market_cap<PoolTokenT<T1, T2, T3>>();
+        let amp = A_(pool_info);
+
+        let total_supply = Token::market_cap<PoolTokenT<T1, T2, T3>>();
+
+        // Initial invariant
+        let _D0 = 0u128;
+        let old_balances = *&pool_info.balances;
+        if (total_supply > 0) {
+            _D0 = get_D_mem_(pool_config, &old_balances, amp);
+        };
+        let new_balances = (copy old_balances);
+
+        {
+            let i = 0;
+            let amonuts = vector[Token::value(&_t1), Token::value(&_t2), Token::value(&_t3)];
+            while (i < n_coins) {
+                let in_amount = *Vector::borrow(&amonuts, i);
+                if (total_supply == 0) {
+                    // dev: initial deposit requries all coins
+                    assert!(in_amount > 0, 400);
+                };
+
+                let new_balance = Vector::borrow_mut(&mut new_balances, i);
+                *new_balance = *new_balance + in_amount;
+            };
+        };
+
+        {
+            let pool = borrow_global_mut<Pool<T1, T2, T3>>(@Owner);
+            Token::deposit(&mut pool.t1, _t1);
+            Token::deposit(&mut pool.t2, _t2);
+            Token::deposit(&mut pool.t3, _t3);
+        };
+
+        // Invariant after change
+        let _D1 = get_D_mem_(pool_config,&new_balances, amp);
+        assert!(_D1 > _D0, 42);
+
+        // we need to recalculate the invariant accounting for fees
+        // to calculate fair user's share
+        let _D2 = _D1;
+
+        if (total_supply==0) {
+            pool_info.balances = new_balances;
+        } else {
+            let i = 0;
+            while (i < n_coins) {
+                let old_balance = *Vector::borrow(&old_balances, i);
+                let new_balance_ref = Vector::borrow_mut(&mut new_balances, i);
+
+                let ideal_balance = _D1 * old_balance / _D0;
+                let difference;
+                if (ideal_balance > *new_balance_ref) {
+                    difference = ideal_balance - (*new_balance_ref);
+                } else {
+                    difference = (*new_balance_ref) - ideal_balance;
+                };
+                let the_fee = fee * difference / FEE_DENOMINATOR;
+                *Vector::borrow_mut(&mut pool_info.balances, i) = *new_balance_ref - (the_fee * admin_fee / FEE_DENOMINATOR);
+                *new_balance_ref = *new_balance_ref - the_fee;
+                i=i+1;
+            };
+            _D2 = get_D_mem_(pool_config, &new_balances, amp);
+        };
+
+        let mint_amount = 0u128;
+        if (total_supply ==0) {
+            mint_amount = _D1;
+        } else {
+            mint_amount == total_supply * (_D2 - _D0) / _D0;
+        };
+        assert!(mint_amount >= _min_mint_amount, 100);
+        let pool_caps = borrow_global<PoolCapabilities<T1,T2,T3>>(@Owner);
+        let lp_token = Token::mint_with_capability<PoolTokenT<T1,T2,T3>>(&pool_caps.mint_cap, mint_amount);
+
+        lp_token
     }
 
     public fun A<T1, T2, T3>() : u128 acquires PoolInfo {
@@ -131,7 +221,7 @@ module Owner::Pool {
 
 
 
-    fun xp_< T1, T2, T3>(config: &PoolConfig<T1,T2,T3>): vector<u128> acquires Pool {
+    fun xp_< T1, T2, T3>(config: &PoolConfig<T1,T2,T3>): vector<u128> acquires PoolInfo {
         let lending_precision = (config.lending_precision as u64);
         let rates = *&config.rates;
 
@@ -151,13 +241,15 @@ module Owner::Pool {
         rates
     }
 
-    fun xp_mem_(rates: vector<u128>, balances: vector<u128>, precision: u64): vector<u128> {
+    fun xp_mem_<T1,T2,T3>(pool_config: &PoolConfig<T1,T2,T3>, balances: &vector<u128>): vector<u128> {
+        let rates = *&pool_config.rates;
+        let precision = (pool_config.precision as u64);
         {
             let i = 0;
 
             while (i < N_COINS) {
                 let rate = Vector::borrow_mut(&mut rates, i);
-                let bal = *Vector::borrow(&balances, i);
+                let bal = *Vector::borrow(balances, i);
                 *rate = *rate * bal / Math::pow(10, precision);
                 i=i+1;
             };
@@ -215,6 +307,10 @@ module Owner::Pool {
             }
         };
         _D
+    }
+
+    fun get_D_mem_<T1,T2,T3>(pool_config: &PoolConfig<T1,T2,T3>, balances: &vector<u128>, amp: u128): u128 {
+        get_D_(&xp_mem_(pool_config, balances), amp)
     }
 
     /// Admin function
