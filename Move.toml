@@ -1,0 +1,10 @@
+[package]
+name = "StableSwap"
+version = "0.0.0"
+
+[dependencies]
+StarcoinFramework = {git = "https://github.com/starcoinorg/starcoin.git", subdir="vm/stdlib", rev="d1c431e98e3d973bbc1f2829a06ce7035046c952"}
+
+[addresses]
+Std="0x1"
+Owner="0xAA"
