@@ -5,6 +5,7 @@ module Owner::Pool {
     use StarcoinFramework::Timestamp;
     use StarcoinFramework::Math;
     use StarcoinFramework::Vector;
+    use Owner::Math as Math2;
     const N_COINS: u64 = 3;
 
     const MIM_RAMP_TIME: u128 = 86400;
@@ -249,12 +250,58 @@ module Owner::Pool {
     }
 
 
-    fun balances_<T1, T2, T3>(pool: &Pool<T1, T2, T3>): vector<u128> {
-        vector[
-            Token::value(&pool.t1),
-            Token::value(&pool.t2),
-            Token::value(&pool.t3)
-        ]
+//    fun balances_<T1, T2, T3>(pool: &Pool<T1, T2, T3>): vector<u128> {
+//        vector[
+//            Token::value(&pool.t1),
+//            Token::value(&pool.t2),
+//            Token::value(&pool.t3)
+//        ]
+//    }
+
+    fun get_y(pool_info: &PoolInfoStore, i: u64, j: u64, x: u128, xp: &vector<u128>): u128 {
+        let n_coins = Vector::length(xp);
+
+
+        let amp = A_(pool_info);
+        let _D = get_D_(xp, amp);
+
+        let _Ann = amp * (n_coins as u128);
+
+        let c = _D;
+        let _S = 0u128;
+
+            {
+                let _x = 0u128;
+                let _i = 0;
+                while (_i < n_coins) {
+                    if (_i == i) {
+                        _x = x;
+                    } else if (_i != j) {
+                        _x = *Vector::borrow(xp,i);
+                    } else {
+                        continue
+                    };
+                    _S = _S + _x;
+                    c = c * _D / (_x * (n_coins as u128));
+                };
+                c = c * _D / (_Ann * (n_coins as u128));
+            };
+        let b = _S + _D / _Ann;
+
+        // calculate y iteratly.
+            {
+                let y_prev;
+                let y = _D;
+                let _i = 0;
+                while (_i < 256) {
+                    y_prev = y;
+                    y = (y * y +c) / (2 * y + b - _D);
+                    if (Math2::diff(y, y_prev) <= 1) {
+                        break
+                    }
+                };
+                y
+            }
     }
 
     /// Handle ramping A up or down
