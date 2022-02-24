@@ -183,6 +183,42 @@ module Owner::Pool {
         lp_token
     }
 
+    public fun remove_liquidity<T1, T2, T3>(lp_token: Token::Token<PoolTokenT<T1,T2,T3>>, min_amounts: &vector<u128>): (Token::Token<T1>,Token::Token<T2>,Token::Token<T3>)
+    acquires  PoolInfo, Pool, PoolCapabilities {
+        let pool_info = borrow_global_mut<PoolInfo<T1, T2, T3>>(@Owner);
+        //let pool_config = borrow_global<PoolConfig<T1, T2, T3>>(@Owner);
+        let total_supply = Token::market_cap<PoolTokenT<T1,T2,T3>>();
+
+
+        let amounts_to_withdraw: vector<u128> = vector[];
+            {
+                let i = 0;
+                let current_balances = &mut pool_info.balances;
+                let lp_amount = Token::value(&lp_token);
+
+                while (i < N_COINS) {
+                    let balance = Vector::borrow_mut(current_balances, i);
+                    let amount_to_withdraw = lp_amount * (*balance) / total_supply;
+                    assert!( amount_to_withdraw >= *Vector::borrow(min_amounts, i), 400);
+                    *balance = (*balance) - amount_to_withdraw;
+                    Vector::push_back(&mut amounts_to_withdraw, amount_to_withdraw);
+                    i = i + 1;
+                };
+            };
+            {
+                // burn lp token
+                let pool_caps = borrow_global<PoolCapabilities<T1,T2,T3>>(@Owner);
+                Token::burn_with_capability(&pool_caps.burn_cap, lp_token);
+
+                // with underlying assets
+                let pool = borrow_global_mut<Pool<T1,T2,T3>>(@Owner);
+                let t1 = Token::withdraw(&mut pool.t1, *Vector::borrow(&amounts_to_withdraw, 0));
+                let t2 = Token::withdraw(&mut pool.t2, *Vector::borrow(&amounts_to_withdraw, 1));
+                let t3 = Token::withdraw(&mut pool.t3, *Vector::borrow(&amounts_to_withdraw, 2));
+                (t1,t2,t3)
+            }
+    }
+
     public fun A<T1, T2, T3>() : u128 acquires PoolInfo {
         let pool_info = borrow_global<PoolInfo<T1,T2,T3>>(@Owner);
         A_(pool_info)
