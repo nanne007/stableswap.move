@@ -40,9 +40,9 @@ module Owner::Pool {
         fee: u128,
         admin_fee: u128,
 
-        lending_precision: u8,
+        lending_precision: u128,
         /// the precison to convert to
-        precision: u8,
+        precision: u128,
         precision_mul: vector<u128>,
         rates: vector<u128>,
     }
@@ -68,25 +68,25 @@ module Owner::Pool {
                 balances: vector[0u128, 0u128, 0u128],
             }
         });
-        let precision = 9;
-        let lending_precision = 9;
+        let precision = Math::pow(10, 9);
+        let lending_precision = Math::pow(10, 9);
         let precision_mul = vector[
-            Math::pow(10, precision) / Token::scaling_factor<T1>(),
-            Math::pow(10, precision) / Token::scaling_factor<T2>(),
-            Math::pow(10, precision) / Token::scaling_factor<T3>(),
+        precision / Token::scaling_factor<T1>(),
+        precision / Token::scaling_factor<T2>(),
+        precision / Token::scaling_factor<T3>(),
         ];
         let rates = vector[
-            Math::pow(10, precision) * Math::pow(10, lending_precision) / Token::scaling_factor<T1>(),
-            Math::pow(10, precision) * Math::pow(10, lending_precision) / Token::scaling_factor<T2>(),
-            Math::pow(10, precision) * Math::pow(10, lending_precision) / Token::scaling_factor<T3>(),
+            precision * lending_precision / Token::scaling_factor<T1>(),
+            precision * lending_precision / Token::scaling_factor<T2>(),
+            precision * lending_precision / Token::scaling_factor<T3>(),
         ];
 
         move_to(sender, PoolConfig<T1,T2,T3> {
             store: PoolConfigStore{
                 fee,
                 admin_fee,
-                lending_precision: (lending_precision as u8),
-                precision: (precision as u8),
+                lending_precision,
+                precision,
                 precision_mul,
                 rates,
             }
@@ -244,19 +244,57 @@ module Owner::Pool {
         amounts_to_withdraw
     }
 
+    public fun exchange_t1_for_t2<T1,T2,T3>(t1: Token::Token<T1>, min_dy: u128): Token::Token<T2> acquires  Pool, PoolInfo, PoolConfig {
+        let pool_info = &mut borrow_global_mut<PoolInfo<T1,T2,T3>>(@Owner).store;
+        let pool_config = &borrow_global<PoolConfig<T1,T2,T3>>(@Owner).store;
+        let (new_balances, dy) = exchange_(pool_config, pool_info, 1, 2, Token::value(&t1), min_dy);
+
+        // update pool balance
+        pool_info.balances = new_balances;
+        // do asset transfer.
+            {
+
+                let pool = borrow_global_mut<Pool<T1,T2,T3>>(@Owner);
+                Token::deposit(&mut pool.t1, t1);
+                let dy = Token::withdraw(&mut pool.t2, dy);
+                dy
+            }
+    }
+
+    /// returns:
+    /// 1. `vector<u128>`: new_balances of the pool
+    /// 2. `u128`: dy
+    /// This function is a view function, it only does calculation.
+    fun exchange_(pool_config: &PoolConfigStore, pool_info: &PoolInfoStore, i: u64, j: u64, dx: u128, min_dy: u128): (vector<u128>, u128) {
+        let rates = &pool_config.rates;
+
+        let old_balances = &pool_info.balances;
+        let xp = xp_mem_(pool_config, old_balances);
+
+        let x = *Vector::borrow(&xp, i) + dx * (*Vector::borrow(rates, i)) / pool_config.precision;
+        let y = get_y(pool_info, i ,j , x, &xp);
+        let dy = *Vector::borrow(&xp, j) - y - 1; // -1 just in case there were some rounding errors.
+        let dy_fee = dy * pool_config.fee / FEE_DENOMINATOR;
+
+        // convert all to real units
+        let dy = (dy - dy_fee) * pool_config.precision / (*Vector::borrow(rates, j));
+        assert!( dy >= min_dy, 400);
+
+        let dy_admin_fee = dy_fee * pool_config.admin_fee / FEE_DENOMINATOR;
+        let dy_admin_fee = dy_admin_fee * pool_config.precision / (*Vector::borrow(rates, j));
+
+        let new_balances = *old_balances;
+        *Vector::borrow_mut(&mut new_balances, i) = (*Vector::borrow(&new_balances, i)) + dx;
+        *Vector::borrow_mut(&mut new_balances, j) = (*Vector::borrow(&new_balances, j)) - (dy + dy_admin_fee);
+
+        (new_balances, dy)
+    }
+
     public fun A<T1, T2, T3>() : u128 acquires PoolInfo {
         let pool_info = &borrow_global<PoolInfo<T1,T2,T3>>(@Owner).store;
         A_(pool_info)
     }
 
-
-//    fun balances_<T1, T2, T3>(pool: &Pool<T1, T2, T3>): vector<u128> {
-//        vector[
-//            Token::value(&pool.t1),
-//            Token::value(&pool.t2),
-//            Token::value(&pool.t3)
-//        ]
-//    }
 
     fun get_y(pool_info: &PoolInfoStore, i: u64, j: u64, x: u128, xp: &vector<u128>): u128 {
         let n_coins = Vector::length(xp);
@@ -329,7 +367,7 @@ module Owner::Pool {
 
 
     fun xp_(config: &PoolConfigStore, balances: &vector<u128>): vector<u128> {
-        let lending_precision = (config.lending_precision as u64);
+        let lending_precision = config.lending_precision;
         let rates = *&config.rates;
 
         {
@@ -338,7 +376,7 @@ module Owner::Pool {
             while (i < N_COINS) {
                 let rate = Vector::borrow_mut(&mut rates, i);
                 let bal = *Vector::borrow(balances, i);
-                *rate = *rate * bal / Math::pow(10, lending_precision);
+                *rate = *rate * bal / lending_precision;
                 i=i+1;
             };
         };
@@ -348,14 +386,14 @@ module Owner::Pool {
 
     fun xp_mem_(pool_config: &PoolConfigStore, balances: &vector<u128>): vector<u128> {
         let rates = *&pool_config.rates;
-        let precision = (pool_config.precision as u64);
+        let precision = pool_config.precision;
         {
             let i = 0;
 
             while (i < N_COINS) {
                 let rate = Vector::borrow_mut(&mut rates, i);
                 let bal = *Vector::borrow(balances, i);
-                *rate = *rate * bal / Math::pow(10, precision);
+                *rate = *rate * bal / precision;
                 i=i+1;
             };
         };
